@@ -1,0 +1,56 @@
+!
+!Version ArubaOS-CX 10.0X.XXXX
+!
+lldp enable
+linecard-module LC1 part-number JL363A
+vrf default
+!
+!
+!
+!
+!
+!
+aaa authentication login default local
+aaa authorization commands default none
+!
+!
+!
+!
+router ospf 1 vrf green
+    area 0.0.0.0
+router pim vrf green
+    enable
+    rp-address 30.0.0.4
+vlan 1
+    no shutdown
+vlan 20
+    no shutdown
+vlan 30
+    no shutdown
+interface 1/1/1
+    no shutdown
+    no routing
+    vlan access 30
+interface 1/1/32
+    no shutdown
+    no routing
+    vlan access 20
+interface bridge_normal-1
+    no shutdown
+interface bridge_normal-2
+    no shutdown
+interface vlan20
+    no shutdown
+    vrf attach green
+    ip address 20.0.0.44/24
+    ip ospf 1 area 0.0.0.0
+    ip pim-sparse enable
+
+interface vlan30
+    no shutdown
+    vrf attach green
+    ip address 30.0.0.44/24
+    ip ospf 1 area 0.0.0.0
+    ip pim-sparse enable
+
+    ip pim-sparse hello-interval 100

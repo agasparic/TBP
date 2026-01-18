@@ -1,0 +1,69 @@
+version 15.0
+no service pad
+service timestamps debug datetime msec
+service timestamps log datetime msec
+!
+hostname Switch-HQ
+!
+enable password cisco123
+!
+vlan 10
+name MGMT
+!
+vlan 20
+name LAN
+!
+vlan 30
+name VOIP
+!
+vlan 40
+name WIFI
+!
+vlan 50
+name TRANSIT_R1
+!
+vlan 60
+name TRANSIT_R2
+!
+interface FastEthernet0/1
+description To Router1
+switchport mode access
+switchport access vlan 50
+!
+interface FastEthernet0/2
+description To Router2
+switchport mode access
+switchport access vlan 60
+!
+interface FastEthernet0/3
+description User PC
+switchport mode access
+switchport access vlan 20
+!
+interface FastEthernet0/4
+description IP Phone
+switchport mode access
+switchport access vlan 20
+switchport voice vlan 30
+!
+interface FastEthernet0/5
+description Wireless Access Point
+switchport mode access
+switchport access vlan 40
+!
+interface Vlan10
+description Switch Management
+ip address 10.10.10.2 255.255.255.0
+no shutdown
+!
+ip default-gateway 10.10.10.1
+!
+line con 0
+password cisco
+login
+!
+line vty 0 4
+password cisco
+login
+transport input telnet
+!

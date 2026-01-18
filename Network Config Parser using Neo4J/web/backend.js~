@@ -1,0 +1,469 @@
+const express = require('express');
+const bodyParser = require('body-parser');
+const neo4j = require('neo4j-driver');
+const path = require('path');
+
+const uri = process.env.NEO4J_URI || 'neo4j://localhost:7687';
+const user = process.env.NEO4J_USER || 'neo4j';
+const password = process.env.NEO4J_PASSWORD || 'MaliPero123';
+const driver = neo4j.driver(uri, neo4j.auth.basic(user, password));
+
+const app = express();
+app.use(bodyParser.text({ type: 'text/*' }));
+app.use(express.static('public'));
+
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'public', 'index.html')));
+
+
+function parseRunningConfig(text) {
+  const lines = text.split(/\r?\n/);
+  const data = { hostname: null, password: null, interfaces: [], vlans: [], dhcpPools: [], accessLists: [] };
+  let cur = null;
+  for (let raw of lines) {
+    const line = raw.trim();
+    if (!line) continue;
+
+    const enableMatch = line.match(/^enable\s+password\s+(.+)$/i);
+    if (enableMatch) {
+      data.password = enableMatch[1].trim();
+      continue;
+    }
+
+    if (line.startsWith('hostname ')) {
+      data.hostname = line.split(/\s+/)[1];
+      continue;
+    }
+    const intMatch = line.match(/^interface\s+(.+)/);
+    if (intMatch) {
+      cur = { type: 'interface', name: intMatch[1], lines: [] };
+      data.interfaces.push(cur);
+      continue;
+    }
+
+    const vlanMatch = line.match(/^vlan\s+(\d+)/);
+    if (vlanMatch) {
+      cur = { type: 'vlan', id: vlanMatch[1], lines: [] };
+      data.vlans.push(cur);
+      continue;
+    }
+
+    const ipDhcpPool = line.match(/^ip dhcp pool\s+(.+)/);
+    if (ipDhcpPool) {
+      cur = { type: 'dhcp', name: ipDhcpPool[1], lines: [] };
+      data.dhcpPools.push(cur);
+      continue;
+    }
+
+    const aclMatch = line.match(/^access-list\s+(\d+|\w+)/);
+    if (aclMatch) {
+      const name = aclMatch[1];
+      let entry = data.accessLists.find(a => a.name === name);
+      if (!entry) {
+        entry = { name, rules: [] };
+        data.accessLists.push(entry);
+      }
+      entry.rules.push(line);
+      cur = null;
+      continue;
+    }
+
+    if (cur) cur.lines.push(line);
+  }
+
+data.interfaces = data.interfaces.map(b => {
+   const obj = { name: b.name };
+       b.lines.forEach(l => {
+       const ip = l.match(/^ip address\s+(\S+)\s+(\S+)/);
+       if (ip) obj.ip = ip[1] + ' ' + ip[2];
+       const desc = l.match(/^description\s+(.+)/);
+       if (desc) obj.description = desc[1];
+       if (l.includes('switchport mode')) obj.mode = (l.split('switchport mode')[1] || '').trim();
+      const dot1q = l.match(/encapsulation dot1Q\s+(\d+)/i);
+      if (dot1q) obj.dot1q = dot1q[1];
+    });
+    return obj;
+  });
+ data.vlans = data.vlans.map(b => {
+    const obj = { id: b.id };
+    b.lines.forEach(l => {
+       const name = l.match(/^ name\s+(.+)/i);
+       if (name) obj.name = name[1];
+     });
+    return obj;
+  });
+
+ data.dhcpPools = data.dhcpPools.map(b => {
+    const obj = { name: b.name };
+    b.lines.forEach(l => {
+      const net = l.match(/^network\s+(\S+)\s+(\S+)/);
+      if (net) obj.network = net[1] + ' ' + net[2];
+      const dr = l.match(/^default-router\s+(.+)/);
+      if (dr) obj.defaultRouter = dr[1].trim();
+    });
+    return obj;
+  });
+
+  return data;
+}
+
+
+async function persistToNeo4j(tx, parsed) {
+  const hostname = parsed.hostname || 'unnamed-device';
+  // create Device
+  await tx.run(
+    'MERGE (d:Device {hostname:$hostname}) RETURN d',
+    { hostname }
+  );
+
+  for (const intf of parsed.interfaces) {
+    await tx.run(
+      `MATCH (d:Device {hostname:$hostname})
+       MERGE (i:Interface {name:$iname})
+       SET i.ip = $ip, i.mode = $mode, i.description = $desc, i.dot1q = $dot1q, i.nat = $nat
+       MERGE (d)-[:HAS_INTERFACE]->(i)`,
+      { hostname, iname: intf.name, ip: intf.ip || null, mode: intf.mode || null, desc: intf.description || null, dot1q: intf.dot1q || null, nat: intf.nat || null }
+    );
+  }
+
+  for (const v of parsed.vlans) {
+    await tx.run(
+      `MATCH (d:Device {hostname:$hostname})
+       MERGE (v:VLAN {id:$vid})
+       SET v.name = $vname
+       MERGE (d)-[:HAS_VLAN]->(v)`,
+      { hostname, vid: v.id, vname: v.name || null }
+    );
+  }
+
+  for (const p of parsed.dhcpPools) {
+    await tx.run(
+      `MATCH (d:Device {hostname:$hostname})
+       MERGE (p:DHCPPool {name:$pname})
+       SET p.network = $network, p.defaultRouter = $dr
+       MERGE (d)-[:HAS_DHCPPOOL]->(p)`,
+      { hostname, pname: p.name, network: p.network || null, dr: p.defaultRouter || null }
+    );
+  }
+
+  for (const a of parsed.accessLists) {
+    await tx.run(
+      `MATCH (d:Device {hostname:$hostname})
+       MERGE (acl:AccessList {name:$aname})
+       SET acl.rules = $rules
+       MERGE (d)-[:HAS_ACL]->(acl)`,
+      { hostname, aname: a.name, rules: a.rules }
+    );
+  }
+}
+
+
+
+app.post('/api/upload-config', async (req, res) => {
+  try {
+    const text = req.body || '';
+    const parsed = parseRunningConfig(text);
+
+    const session = driver.session();
+    try {
+      await session.writeTransaction(async tx => {
+        await persistToNeo4j(tx, parsed);
+      });
+    } finally {
+      await session.close();
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error('Upload error', err);
+    res.status(500).json({ error: 'Parsing or Neo4j error' });
+  }
+});
+
+module.exports = app;
+
+app.get('/api/devices', async (req, res) => {
+  const session = driver.session();
+  try {
+    const result = await session.run('MATCH (d:Device) RETURN d.hostname AS hostname ORDER BY d.hostname');
+    const names = result.records.map(r => r.get('hostname')).filter(Boolean);
+    res.json(names);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+app.get('/api/device/:hostname', async (req, res) => {
+  const hostname = req.params.hostname;
+  const session = driver.session();
+  try {
+
+    const devRes = await session.run('MATCH (d:Device {hostname:$hostname}) RETURN d LIMIT 1', { hostname });
+    if (devRes.records.length === 0) return res.status(404).json({ error: 'Not found' });
+
+
+    const ifRes = await session.run(
+      'MATCH (d:Device {hostname:$hostname})-[:HAS_INTERFACE]->(i:Interface) RETURN i ORDER BY i.name',
+      { hostname }
+    );
+      
+    const interfaces = ifRes.records.map(r => {
+      const n = r.get('i');
+      return { name: n.properties.name, ip: n.properties.ip || null, mode: n.properties.mode || null, description: n.properties.description || null, dot1q: n.properties.dot1q || null, nat: n.properties.nat || null };
+    });
+
+    const vlanRes = await session.run(
+      'MATCH (d:Device {hostname:$hostname})-[:HAS_VLAN]->(v:VLAN) RETURN v ORDER BY toInteger(v.id)',
+      { hostname }
+    );
+      
+    const vlans = vlanRes.records.map(r => {
+      const n = r.get('v');
+      return { id: n.properties.id, name: n.properties.name || null };
+    });
+
+    const dhcpRes = await session.run(
+      'MATCH (d:Device {hostname:$hostname})-[:HAS_DHCPPOOL]->(p:DHCPPool) RETURN p ORDER BY p.name',
+      { hostname }
+    );
+    const dhcpPools = dhcpRes.records.map(r => {
+      const n = r.get('p');
+      return { name: n.properties.name, network: n.properties.network || null, defaultRouter: n.properties.defaultRouter || null };
+    });
+
+    const aclRes = await session.run(
+      'MATCH (d:Device {hostname:$hostname})-[:HAS_ACL]->(a:AccessList) RETURN a ORDER BY a.name',
+      { hostname }
+    );
+      
+    const accessLists = aclRes.records.map(r => {
+      const n = r.get('a');
+      return { name: n.properties.name, rules: n.properties.rules || [] };
+    });
+
+    res.json({ hostname, interfaces, vlans, dhcpPools, accessLists });
+  } catch (e) {
+      console.error(e);
+      
+      res.status(500).json({ error: 'Neo4j error' });
+      
+  } finally {
+    await session.close();
+  }
+});
+
+
+app.post('/api/upload-config', async (req, res) => {
+  try {
+    const text = req.body || '';
+    const parsed = parseRunningConfig(text);
+
+    const session = driver.session();
+    try {
+      await session.writeTransaction(async tx => {
+        await persistToNeo4j(tx, parsed);
+      });
+    } finally {
+      await session.close();
+    }
+
+    res.json(parsed);
+  } catch (err) {
+    console.error('Upload error', err);
+    res.status(500).json({ error: 'Parsing or Neo4j error' });
+  }
+});
+
+app.get('/api/devices', async (req, res) => {
+  const session = driver.session();
+  try {
+    const result = await session.run('MATCH (d:Device) RETURN d.hostname AS hostname ORDER BY d.hostname');
+    const names = result.records.map(r => r.get('hostname')).filter(Boolean);
+    res.json(names);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+app.get('/api/device/:hostname', async (req, res) => {
+  const hostname = req.params.hostname;
+  const session = driver.session();
+  try {
+    const devRes = await session.run('MATCH (d:Device {hostname:$hostname}) RETURN d LIMIT 1', { hostname });
+    if (devRes.records.length === 0) return res.status(404).json({error: 'Not found' });
+
+    const ifRes = await session.run('MATCH (d:Device {hostname:$hostname})-[:HAS_INTERFACE]->(i:Interface) RETURN i ORDER BY i.name', { hostname });
+    const interfaces = ifRes.records.map(r => {
+      const n = r.get('i');
+      return { name: n.properties.name, ip: n.properties.ip || null, mode: n.properties.mode || null, description: n.properties.description || null, dot1q: n.properties.dot1q|| null, nat: n.properties.nat || null };
+    });
+
+    const vlanRes = await session.run('MATCH (d:Device {hostname:$hostname})-[:HAS_VLAN]->(v:VLAN) RETURN v ORDER BY toInteger(v.id)', { hostname });
+    const vlans = vlanRes.records.map(r => {
+      const n = r.get('v');
+      return { id: n.properties.id, name: n.properties.name || null };
+    });
+
+    const dhcpRes = await session.run('MATCH (d:Device {hostname:$hostname})-[:HAS_DHCPPOOL]->(p:DHCPPool) RETURN p ORDER BY p.name', { hostname });
+    const dhcpPools = dhcpRes.records.map(r => {
+      const n = r.get('p');
+      return { name: n.properties.name, network: n.properties.network ||null, defaultRouter: n.properties.defaultRouter ||null };
+    });
+
+    const aclRes = await session.run('MATCH (d:Device {hostname:$hostname})-[:HAS_ACL]->(a:AccessList) RETURN a ORDER BY a.name', { hostname });
+    const accessLists = aclRes.records.map(r => {
+      const n = r.get('a');
+      return { name: n.properties.name, rules: n.properties.rules || [] };
+    });
+
+    res.json({hostname, interfaces, vlans, dhcpPools, accessLists });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+
+app.get('/api/search/vlan', async (req, res) => {
+  const vlan = req.query.vlan;
+  if (!vlan) return res.status(400).json({ error: 'vlan query parameter required' });
+
+  const session = driver.session();
+  try {
+    const query = `
+      MATCH (d:Device)-[:HAS_INTERFACE]->(i)-[:MEMBER_OF]->(v:VLAN {id:$vlan})
+      RETURN DISTINCT d.hostname AS hostname, d.role AS role
+    `;
+    const result = await session.run(query, { vlan });
+    const data = result.records.map(r => {
+      return { hostname: r.get('hostname'), role: r.get('role') };
+    });
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+app.get('/api/search/port-mode', async (req, res) => {
+  const mode = (req.query.mode || '').toLowerCase();
+  if (!mode || !['trunk', 'access'].includes(mode)) {
+    return res.status(400).json({ error: "Mode query parameter required (use 'trunk' or 'access')" });
+  }
+
+  const session = driver.session();
+  try {
+    const query = `
+      MATCH (d:Device)-[:HAS_INTERFACE]->(i:Interface)
+      WHERE toLower(i.mode) = $mode
+      RETURN d.hostname AS hostname, i.name AS interface, i.mode AS mode, i.ip AS ip, i.dot1q AS dot1q, i.vlans AS vlans
+      ORDER BY d.hostname, i.name
+    `;
+    const result = await session.run(query, { mode });
+    const data = result.records.map(r => {
+      const vlans = r.get('vlans');
+      return {
+        hostname: r.get('hostname'),
+        interface: r.get('interface'),
+        mode: r.get('mode'),
+        ip: r.get('ip') || null,
+        dot1q: r.get('dot1q') || null,
+        vlans: Array.isArray(vlans) ? vlans : (vlans ? [vlans] : [])
+      };
+    });
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+app.post('/api/search/cypher', express.json(), async (req, res) => {
+  const query = (req.body.query || '').trim();
+
+  if (!query) {
+    return res.status(400).send('Cypher query required');
+  }
+
+  const forbidden = /\b(create|merge|delete|set|remove|drop|call)\b/i;
+  if (forbidden.test(query)) {
+    return res.status(400).send('Only read-only Cypher queries are allowed!');
+  }
+
+  const session = driver.session({ defaultAccessMode: neo4j.session.READ });
+
+  try {
+    const result = await session.run(query);
+
+    const rows = result.records.map(record => {
+      const obj = {};
+      record.keys.forEach(k => {
+        const v = record.get(k);
+
+        if (neo4j.isInt(v)) {
+          obj[k] = v.toNumber();
+        } else if (v && v.properties) {
+          obj[k] = v.properties;
+        } else {
+          obj[k] = v;
+        }
+      });
+      return obj;
+    });
+
+    res.json(rows);
+  } catch (e) {
+    console.error(e);
+    res.status(400).send(e.message);
+  } finally {
+    await session.close();
+  }
+});
+
+app.get('/api/search/topology', async (req, res) => {
+  const session = driver.session();
+  try {
+    const query = `
+      MATCH (a:Interface)-[:CONNECTED_TO]->(b:Interface)
+      MATCH (devA:Device)-[:HAS_INTERFACE]->(a)
+      MATCH (devB:Device)-[:HAS_INTERFACE]->(b)
+      WHERE devA.hostname < devB.hostname
+      RETURN 
+        devA.hostname AS deviceA, a.name AS interfaceA, a.description AS descA,
+        devB.hostname AS deviceB, b.name AS interfaceB, b.description AS descB
+    `;
+    const result = await session.run(query);
+
+    const data = result.records.map(r => ({
+      deviceA: r.get('deviceA'),
+      interfaceA: r.get('interfaceA'),
+      descA: r.get('descA') || '',
+      deviceB: r.get('deviceB'),
+      interfaceB: r.get('interfaceB'),
+      descB: r.get('descB') || ''
+    }));
+
+    res.json(data);
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: 'Neo4j error' });
+  } finally {
+    await session.close();
+  }
+});
+
+
+const port = process.env.PORT || 12345;
+app.listen(port, () => console.log(`Backend listening on http://localhost:${port}`));
+
